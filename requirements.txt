@@ -5,3 +5,4 @@ numpy>=1.23,<2.0
 pillow>=9.0.0
 easyocr>=1.7.0
 pytesseract>=0.3.10
+fpdf2>=2.7.0
