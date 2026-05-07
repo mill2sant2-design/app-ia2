@@ -4,5 +4,3 @@ opencv-python-headless==4.10.0.84
 numpy>=1.23,<2.0
 pillow>=9.0.0
 easyocr>=1.7.0
-paddlepaddle==2.6.1
-paddleocr==2.7.3
