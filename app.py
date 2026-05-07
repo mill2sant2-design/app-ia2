@@ -141,7 +141,10 @@ def procesar_placa(cropped, conf_ocr):
     variantes, proc_display = preprocesar(cropped)
     cands_easy = run_easyocr(variantes, conf_ocr)
     cands_tess = run_tesseract(variantes)
-    todos       = cands_easy + cands_tess
+
+    # Tesseract recibe 5x mas peso porque lee mejor caracteres dificiles
+    todos = cands_easy + (cands_tess * 5)
+
     placa_final = votar_placa(todos)
     return placa_final, cands_easy, cands_tess, proc_display, variantes
 
@@ -149,7 +152,7 @@ st.sidebar.header('Configuracion')
 conf_threshold = st.sidebar.slider('Confianza deteccion', 0.0, 1.0, 0.25)
 conf_ocr       = st.sidebar.slider('Confianza OCR',       0.0, 1.0, 0.15)
 st.sidebar.markdown('---')
-st.sidebar.caption('Motores: EasyOCR + Tesseract')
+st.sidebar.caption('Motores: EasyOCR + Tesseract (peso 5x)')
 st.sidebar.caption('Recomendado: deteccion 0.1-0.3, OCR 0.1-0.2')
 
 uploaded_file = st.file_uploader('Sube una imagen', type=['jpg', 'jpeg', 'png'])
