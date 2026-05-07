@@ -5,6 +5,12 @@ import numpy as np
 import easyocr
 from ultralytics import YOLO
 
+try:
+    from paddleocr import PaddleOCR
+    PADDLE_DISPONIBLE = True
+except ImportError:
+    PADDLE_DISPONIBLE = False
+
 st.set_page_config(page_title="Detección de Placas", layout="wide")
 st.title("🚗 Detección, Recorte y Lectura de Placas Vehiculares")
 
@@ -14,11 +20,23 @@ def load_model():
     return YOLO("models/best.pt")
 
 @st.cache_resource
-def load_ocr():
+def load_easy():
     return easyocr.Reader(['es'], gpu=False)
 
-model  = load_model()
-reader = load_ocr()
+@st.cache_resource
+def load_paddle():
+    if PADDLE_DISPONIBLE:
+        return PaddleOCR(
+            use_angle_cls=True,
+            lang='en',
+            use_gpu=False,
+            show_log=False
+        )
+    return None
+
+model         = load_model()
+easy_reader   = load_easy()
+paddle_reader = load_paddle()
 
 ALLOWLIST = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
@@ -42,37 +60,35 @@ def corregir_placa(t: str) -> str:
     final  = ultimo if ultimo.isalpha() else ultimo.translate(LETRA_A_NUMERO)
     return letras + nums + final
 
-def extraer_placa(texto: str) -> tuple:
-    """
-    Ventana deslizante de 6 chars.
-    Elige la ventana con menos correcciones necesarias.
-    """
+def extraer_placa(texto: str) -> str | None:
+    """Ventana deslizante con mínimo de correcciones."""
     patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
     limpio = re.sub(r'[^A-Z0-9]', '', texto.upper())
 
-    mejor_placa        = None
-    menor_correcciones = float('inf')
+    mejor        = None
+    min_corr     = float('inf')
 
     for i in range(len(limpio) - 5):
         candidato = limpio[i:i+6]
         corregido = corregir_placa(candidato)
         if patron.match(corregido):
             correcciones = sum(1 for a, b in zip(candidato, corregido) if a != b)
-            if correcciones < menor_correcciones:
-                menor_correcciones = correcciones
-                mejor_placa        = corregido
+            if correcciones < min_corr:
+                min_corr = correcciones
+                mejor    = corregido
 
-    return mejor_placa, menor_correcciones
+    return mejor
 
 def filtrar_por_altura(resultado: list, img_h: int, min_ratio: float = 0.30) -> list:
-    """Descarta texto pequeño (ciudad) filtrando por altura relativa."""
-    return [
-        (bbox, txt, prob) for (bbox, txt, prob) in resultado
-        if (max(p[1] for p in bbox) - min(p[1] for p in bbox)) / img_h >= min_ratio
-    ]
+    filtrados = []
+    for (bbox, txt, prob) in resultado:
+        ys     = [p[1] for p in bbox]
+        char_h = max(ys) - min(ys)
+        if (char_h / img_h) >= min_ratio:
+            filtrados.append((bbox, txt, prob))
+    return filtrados
 
 def preprocesar(cropped: np.ndarray) -> tuple:
-    """Genera 5 variantes de preprocesamiento."""
     grande = cv2.resize(cropped, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     gray   = cv2.cvtColor(grande, cv2.COLOR_BGR2GRAY)
 
@@ -87,46 +103,113 @@ def preprocesar(cropped: np.ndarray) -> tuple:
     variantes = [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)]
     return variantes, otsu
 
-def ocr_multi_variante(variantes: list, conf_ocr: float) -> tuple:
-    """
-    Prueba cada variante con EasyOCR.
-    Devuelve la placa con menos correcciones entre todas las variantes.
-    """
-    patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
+# ── OCR con EasyOCR ────────────────────────────────────────────────────────────
+def ocr_easy(img, img_h: int, conf_ocr: float) -> list[str]:
+    """Devuelve lista de placas válidas encontradas por EasyOCR."""
+    resultado = easy_reader.readtext(
+        img,
+        allowlist=ALLOWLIST,
+        contrast_ths=0.3,
+        adjust_contrast=0.7,
+        text_threshold=0.4,
+        low_text=0.3,
+        paragraph=False,
+    )
+    filtrado    = filtrar_por_altura(resultado, img_h, min_ratio=0.30)
+    texto_unido = ''.join(txt for (_, txt, prob) in filtrado if prob >= conf_ocr)
+    placa       = extraer_placa(texto_unido)
+    return [placa] if placa else []
 
-    mejor_placa        = None
-    menor_correcciones = float('inf')
-    mejor_fragmentos   = []
-    mejor_crudo        = []
+# ── OCR con PaddleOCR ──────────────────────────────────────────────────────────
+def ocr_paddle(img, conf_ocr: float) -> list[str]:
+    """Devuelve lista de placas válidas encontradas por PaddleOCR."""
+    if paddle_reader is None:
+        return []
+    try:
+        # Asegurar que la imagen sea uint8 RGB/BGR
+        if len(img.shape) == 2:
+            img_p = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img_p = img
+
+        result = paddle_reader.ocr(img_p, cls=True)
+
+        if not result or not result[0]:
+            return []
+
+        img_h = img_p.shape[0]
+        textos = []
+        for linea in result[0]:
+            bbox_raw, (txt, conf) = linea
+            # Normalizar bbox al formato de EasyOCR [[x,y],...]
+            bbox = [[int(p[0]), int(p[1])] for p in bbox_raw]
+            ys     = [p[1] for p in bbox]
+            char_h = max(ys) - min(ys)
+            if conf >= conf_ocr and (char_h / img_h) >= 0.30:
+                limpio = re.sub(r'[^A-Z0-9]', '', txt.upper())
+                textos.append(limpio)
+
+        texto_unido = ''.join(textos)
+        placa = extraer_placa(texto_unido)
+        return [placa] if placa else []
+
+    except Exception:
+        return []
+
+# ── Votación carácter a carácter ───────────────────────────────────────────────
+def votar_placa(candidatos: list[str]) -> str | None:
+    """
+    Recibe todas las placas válidas de ambos motores y todas las variantes.
+    Vota por mayoría en cada posición.
+    """
+    candidatos = [p for p in candidatos if p and len(p) == 6]
+    if not candidatos:
+        return None
+    if len(candidatos) == 1:
+        return candidatos[0]
+
+    resultado = ''
+    for i in range(6):
+        chars    = [p[i] for p in candidatos]
+        ganador  = max(set(chars), key=chars.count)
+        resultado += ganador
+
+    return resultado
+
+# ── Pipeline completo ──────────────────────────────────────────────────────────
+def procesar_placa(cropped: np.ndarray, conf_ocr: float) -> tuple:
+    """
+    Corre EasyOCR + PaddleOCR sobre todas las variantes,
+    recolecta candidatos y devuelve la placa votada.
+    """
+    variantes, proc_display = preprocesar(cropped)
+    todos_candidatos        = []
+    log_motores             = {'easy': [], 'paddle': []}
 
     for img in variantes:
-        img_h     = img.shape[0]
-        resultado = reader.readtext(
-            img,
-            allowlist=ALLOWLIST,
-            contrast_ths=0.3,
-            adjust_contrast=0.7,
-            text_threshold=0.4,
-            low_text=0.3,
-            paragraph=False,
-        )
-        filtrado    = filtrar_por_altura(resultado, img_h)
-        texto       = ''.join(t for (_, t, p) in filtrado if p >= conf_ocr)
-        placa, corr = extraer_placa(texto)
+        img_h = img.shape[0]
 
-        if placa and patron.match(placa) and corr < menor_correcciones:
-            menor_correcciones = corr
-            mejor_placa        = placa
-            mejor_fragmentos   = [t.upper() for (_, t, p) in filtrado if p >= conf_ocr]
-            mejor_crudo        = resultado
+        # EasyOCR
+        placas_easy = ocr_easy(img, img_h, conf_ocr)
+        todos_candidatos.extend(placas_easy)
+        log_motores['easy'].extend(placas_easy)
 
-    return mejor_placa, mejor_fragmentos, mejor_crudo
+        # PaddleOCR
+        placas_paddle = ocr_paddle(img, conf_ocr)
+        todos_candidatos.extend(placas_paddle)
+        log_motores['paddle'].extend(placas_paddle)
+
+    placa_final = votar_placa(todos_candidatos)
+    return placa_final, todos_candidatos, log_motores, proc_display, variantes
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.header("Configuración")
 conf_threshold = st.sidebar.slider("Confianza detección", 0.0, 1.0, 0.25)
 conf_ocr       = st.sidebar.slider("Confianza OCR",       0.0, 1.0, 0.15)
 st.sidebar.markdown("---")
+motor_info = "✅ EasyOCR + PaddleOCR activos" if PADDLE_DISPONIBLE \
+             else "⚠️ Solo EasyOCR (PaddleOCR no disponible)"
+st.sidebar.caption(motor_info)
 st.sidebar.caption(
     "💡 Si la placa no se lee correctamente, "
     "baja ambos sliders. Valores recomendados: "
@@ -164,29 +247,16 @@ if uploaded_file is not None:
                 x2, y2 = min(w, x2), min(h, y2)
                 cropped = image[y1:y2, x1:x2]
 
-                variantes, proc_display = preprocesar(cropped)
-                placa_valida, fragmentos, resultado_crudo = ocr_multi_variante(
-                    variantes, conf_ocr
-                )
+                with st.spinner(f"Leyendo placa {i+1}..."):
+                    placa_final, candidatos, log_motores, proc_display, variantes = \
+                        procesar_placa(cropped, conf_ocr)
 
                 st.image(cropped, channels="BGR", caption=f"Placa {i+1}")
 
-                if placa_valida:
-                    st.success(f"🔤 **{placa_valida}**")
-                elif fragmentos:
-                    st.warning(f"⚠️ No coincide con formato: {' '.join(fragmentos)}")
+                if placa_final:
+                    st.success(f"🔤 **{placa_final}**")
                 else:
-                    st.warning("⚠️ Texto no legible")
+                    st.warning("⚠️ No se pudo leer la placa")
 
                 with st.expander(f"Detalles — Placa {i+1}"):
-                    st.write(f"**Confianza YOLO:** {float(box.conf[0]):.2%}")
-                    st.write(f"**Fragmentos OCR:** {fragmentos}")
-                    st.write(f"**OCR crudo:** {resultado_crudo}")
-                    col_v1, col_v2 = st.columns(2)
-                    with col_v1:
-                        st.image(proc_display, caption="Otsu")
-                    with col_v2:
-                        st.image(variantes[2], caption="CLAHE + Otsu")
-
-        else:
-            st.warning("No se detectaron placas en la imagen.")
+                    st.write(f"**Confianza
