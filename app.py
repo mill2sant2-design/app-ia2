@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import cv2
 import numpy as np
@@ -16,13 +17,29 @@ def load_model():
 def load_ocr():
     return easyocr.Reader(['es'], gpu=False)
 
-model    = load_model()
-reader   = load_ocr()
+model  = load_model()
+reader = load_ocr()
+
+# ── Validar formato de placa colombiana ────────────────────────────────────────
+def extraer_placa(fragmentos: list) -> str:
+    """
+    Busca entre los fragmentos OCR uno que coincida con el formato
+    de placa colombiana:
+      - Carro : 3 letras + 3 dígitos       (AAA000)
+      - Moto  : 3 letras + 2 dígitos + 1 letra (AAA00A)
+    Devuelve el texto limpio del primer match, o None si no hay.
+    """
+    patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
+    for frag in fragmentos:
+        limpio = re.sub(r'[^A-Z0-9]', '', frag.upper())
+        if patron.match(limpio):
+            return limpio
+    return None
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.header("Configuración")
-conf_threshold  = st.sidebar.slider("Confianza detección", 0.0, 1.0, 0.5)
-conf_ocr        = st.sidebar.slider("Confianza OCR",       0.0, 1.0, 0.4)
+conf_threshold = st.sidebar.slider("Confianza detección", 0.0, 1.0, 0.5)
+conf_ocr       = st.sidebar.slider("Confianza OCR",       0.0, 1.0, 0.4)
 
 # ── Subida de imagen ───────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Sube una imagen", type=["jpg", "jpeg", "png"])
@@ -35,9 +52,9 @@ if uploaded_file is not None:
     h, w, _    = image.shape
 
     # Predicción YOLO
-    results          = model.predict(image, conf=conf_threshold)
-    annotated_image  = results[0].plot()
-    boxes            = results[0].boxes
+    results         = model.predict(image, conf=conf_threshold)
+    annotated_image = results[0].plot()
+    boxes           = results[0].boxes
 
     # ── Layout principal ───────────────────────────────────────────────────────
     col_det, col_placas = st.columns(2)
@@ -61,31 +78,38 @@ if uploaded_file is not None:
 
                 # ── Preprocesamiento para OCR ──────────────────────────────────
                 gray    = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-                gray    = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                gray    = cv2.resize(gray, None, fx=2, fy=2,
+                                     interpolation=cv2.INTER_CUBIC)
                 gray    = cv2.GaussianBlur(gray, (3, 3), 0)
-                _, proc = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                _, proc = cv2.threshold(gray, 0, 255,
+                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
                 # ── OCR ────────────────────────────────────────────────────────
-                resultado   = reader.readtext(proc)
-                fragmentos  = [
+                resultado  = reader.readtext(proc)
+                fragmentos = [
                     txt.upper()
                     for (_, txt, prob) in resultado
                     if prob >= conf_ocr
                 ]
-                texto_placa = " ".join(fragmentos) if fragmentos else "No legible"
+
+                placa_valida = extraer_placa(fragmentos)
 
                 # ── Mostrar resultado ──────────────────────────────────────────
                 st.image(cropped, channels="BGR", caption=f"Placa {i+1}")
-                confianza_yolo = float(box.conf[0])
 
-                if fragmentos:
-                    st.success(f"🔤 **{texto_placa}**")
+                if placa_valida:
+                    st.success(f"🔤 **{placa_valida}**")
+                elif fragmentos:
+                    st.warning(
+                        f"⚠️ No coincide con formato colombiano: "
+                        f"{' '.join(fragmentos)}"
+                    )
                 else:
                     st.warning("⚠️ Texto no legible")
 
                 with st.expander(f"Detalles — Placa {i+1}"):
-                    st.write(f"**Confianza YOLO:** {confianza_yolo:.2%}")
-                    st.write(f"**Fragmentos OCR detectados:** {resultado}")
+                    st.write(f"**Confianza YOLO:** {float(box.conf[0]):.2%}")
+                    st.write(f"**Fragmentos OCR crudos:** {resultado}")
                     st.image(proc, caption="Imagen procesada para OCR")
 
         else:
