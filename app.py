@@ -34,7 +34,6 @@ LETRA_A_NUMERO = str.maketrans({
 })
 
 def corregir_placa(t: str) -> str:
-    """Corrección posicional sobre exactamente 6 caracteres."""
     if len(t) != 6:
         return t
     letras = t[:3].translate(NUMERO_A_LETRA)
@@ -43,54 +42,50 @@ def corregir_placa(t: str) -> str:
     final  = ultimo if ultimo.isalpha() else ultimo.translate(LETRA_A_NUMERO)
     return letras + nums + final
 
-def extraer_placa(texto_completo: str) -> str | None:
-    """
-    Busca un patrón de 6 caracteres alfanuméricos dentro del texto crudo
-    (maneja prefijos/sufijos fantasma como 'I', '1', espacios, guiones).
-    """
-    patron_valido = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
-
-    # Limpiar: solo letras y números
-    limpio = re.sub(r'[^A-Z0-9]', '', texto_completo.upper())
-
-    # Buscar todas las ventanas de 6 caracteres consecutivos
+def extraer_placa(texto: str) -> str | None:
+    """Ventana deslizante de 6 chars sobre el texto limpio."""
+    patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
+    limpio = re.sub(r'[^A-Z0-9]', '', texto.upper())
     for i in range(len(limpio) - 5):
-        candidato = limpio[i:i+6]
-        corregido = corregir_placa(candidato)
-        if patron_valido.match(corregido):
+        corregido = corregir_placa(limpio[i:i+6])
+        if patron.match(corregido):
             return corregido
-
     return None
 
-def preprocesar(cropped: np.ndarray) -> tuple:
+def filtrar_por_altura(resultado: list, img_h: int, min_ratio: float = 0.30) -> list:
     """
-    Recorta el 65% superior (elimina ciudad) y genera variantes.
-    Devuelve (lista_variantes, imagen_display_para_UI).
+    Descarta detecciones cuya altura sea menor a min_ratio * altura_imagen.
+    Esto elimina el texto pequeño de la ciudad sin tocar los caracteres grandes.
     """
-    # ── Eliminar franja inferior (ciudad) ──────────────────────────────────────
-    h = cropped.shape[0]
-    solo_numero = cropped[:int(h * 0.65), :]   # <── clave
+    filtrados = []
+    for (bbox, txt, prob) in resultado:
+        ys       = [p[1] for p in bbox]
+        char_h   = max(ys) - min(ys)
+        ratio    = char_h / img_h
+        if ratio >= min_ratio:
+            filtrados.append((bbox, txt, prob))
+    return filtrados
 
-    # Escalar x3
-    grande = cv2.resize(solo_numero, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+def preprocesar(cropped: np.ndarray) -> list:
+    """Genera variantes sin recortar la imagen original."""
+    grande = cv2.resize(cropped, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     gray   = cv2.cvtColor(grande, cv2.COLOR_BGR2GRAY)
 
-    # Variantes
-    _, otsu    = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    clahe      = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    gray_c     = clahe.apply(gray)
-    _, otsu_c  = cv2.threshold(gray_c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel     = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharp      = cv2.filter2D(gray, -1, kernel)
-    _, otsu_s  = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu   = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    clahe     = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    _, otsu_c = cv2.threshold(clahe.apply(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel    = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    _, otsu_s = cv2.threshold(cv2.filter2D(gray, -1, kernel), 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    variantes = [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)]
-    return variantes, otsu
+    return [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)], otsu
 
 def ocr_multi_variante(variantes: list, conf_ocr: float) -> tuple:
-    """Prueba cada variante y devuelve la primera con placa válida."""
+    patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
+
     for img in variantes:
-        resultado = reader.readtext(
+        img_h      = img.shape[0]
+        resultado  = reader.readtext(
             img,
             allowlist=ALLOWLIST,
             contrast_ths=0.3,
@@ -99,20 +94,25 @@ def ocr_multi_variante(variantes: list, conf_ocr: float) -> tuple:
             low_text=0.3,
             paragraph=False,
         )
-        # Unir todos los fragmentos con confianza suficiente
+        # ── Filtrar por tamaño: descartar texto pequeño (ciudad) ───────────────
+        resultado_filtrado = filtrar_por_altura(resultado, img_h, min_ratio=0.30)
+
         texto_unido = ''.join(
-            txt for (_, txt, prob) in resultado if prob >= conf_ocr
+            txt for (_, txt, prob) in resultado_filtrado if prob >= conf_ocr
         )
         placa = extraer_placa(texto_unido)
-        if placa:
-            fragmentos = [txt.upper() for (_, txt, prob) in resultado if prob >= conf_ocr]
-            return placa, fragmentos, resultado
+        if placa and patron.match(placa):
+            fragmentos = [txt.upper() for (_, txt, prob) in resultado_filtrado
+                          if prob >= conf_ocr]
+            return placa, fragmentos, resultado_filtrado
 
-    # Fallback: primera variante sin filtro de confianza
-    resultado  = reader.readtext(variantes[0], allowlist=ALLOWLIST, paragraph=False)
-    texto_unido = ''.join(txt for (_, txt, _prob) in resultado)
-    fragmentos  = [txt.upper() for (_, txt, _prob) in resultado]
-    return extraer_placa(texto_unido), fragmentos, resultado
+    # Fallback sin filtro de confianza
+    img_h     = variantes[0].shape[0]
+    resultado = reader.readtext(variantes[0], allowlist=ALLOWLIST, paragraph=False)
+    resultado_filtrado = filtrar_por_altura(resultado, img_h, min_ratio=0.30)
+    texto_unido = ''.join(txt for (_, txt, _p) in resultado_filtrado)
+    fragmentos  = [txt.upper() for (_, txt, _p) in resultado_filtrado]
+    return extraer_placa(texto_unido), fragmentos, resultado_filtrado
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.header("Configuración")
@@ -172,13 +172,13 @@ if uploaded_file is not None:
 
                 with st.expander(f"Detalles — Placa {i+1}"):
                     st.write(f"**Confianza YOLO:** {float(box.conf[0]):.2%}")
-                    st.write(f"**Fragmentos OCR:** {fragmentos}")
+                    st.write(f"**Fragmentos OCR (filtrados):** {fragmentos}")
                     st.write(f"**OCR crudo:** {resultado_crudo}")
                     col_v1, col_v2 = st.columns(2)
                     with col_v1:
-                        st.image(proc_display, caption="Otsu (sin ciudad)")
+                        st.image(proc_display, caption="Otsu completo")
                     with col_v2:
-                        st.image(variantes[2], caption="CLAHE + Otsu (sin ciudad)")
+                        st.image(variantes[2], caption="CLAHE + Otsu")
 
         else:
             st.warning("No se detectaron placas en la imagen.")
