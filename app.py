@@ -3,6 +3,7 @@ import streamlit as st
 import cv2
 import numpy as np
 import easyocr
+import pytesseract
 from ultralytics import YOLO
 
 st.set_page_config(page_title="Deteccion de Placas", layout="wide")
@@ -27,6 +28,12 @@ EASY_CONFIGS = [
     dict(contrast_ths=0.4, adjust_contrast=0.6, text_threshold=0.5, low_text=0.4),
     dict(contrast_ths=0.1, adjust_contrast=0.9, text_threshold=0.3, low_text=0.2),
     dict(contrast_ths=0.5, adjust_contrast=0.5, text_threshold=0.6, low_text=0.4),
+]
+
+TESS_PSMS = [
+    r'--oem 1 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+    r'--oem 1 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+    r'--oem 1 --psm 13 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
 ]
 
 NUMERO_A_LETRA = str.maketrans({
@@ -102,6 +109,23 @@ def run_easyocr(variantes, conf_ocr):
                 continue
     return candidatos
 
+def run_tesseract(variantes):
+    candidatos = []
+    for img in variantes:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) \
+               if len(img.shape) == 3 else img
+        gray = cv2.copyMakeBorder(gray, 20, 20, 20, 20,
+                                   cv2.BORDER_CONSTANT, value=255)
+        for cfg in TESS_PSMS:
+            try:
+                texto = pytesseract.image_to_string(gray, config=cfg).strip()
+                placa = extraer_placa(texto)
+                if placa:
+                    candidatos.append(placa)
+            except Exception:
+                continue
+    return candidatos
+
 def votar_placa(candidatos):
     candidatos = [p for p in candidatos if p and len(p) == 6]
     if not candidatos:
@@ -115,15 +139,17 @@ def votar_placa(candidatos):
 
 def procesar_placa(cropped, conf_ocr):
     variantes, proc_display = preprocesar(cropped)
-    candidatos = run_easyocr(variantes, conf_ocr)
-    placa_final = votar_placa(candidatos)
-    return placa_final, candidatos, proc_display, variantes
+    cands_easy = run_easyocr(variantes, conf_ocr)
+    cands_tess = run_tesseract(variantes)
+    todos       = cands_easy + cands_tess
+    placa_final = votar_placa(todos)
+    return placa_final, cands_easy, cands_tess, proc_display, variantes
 
 st.sidebar.header('Configuracion')
 conf_threshold = st.sidebar.slider('Confianza deteccion', 0.0, 1.0, 0.25)
 conf_ocr       = st.sidebar.slider('Confianza OCR',       0.0, 1.0, 0.15)
 st.sidebar.markdown('---')
-st.sidebar.caption('Motor: EasyOCR con 25 lecturas por placa')
+st.sidebar.caption('Motores: EasyOCR + Tesseract')
 st.sidebar.caption('Recomendado: deteccion 0.1-0.3, OCR 0.1-0.2')
 
 uploaded_file = st.file_uploader('Sube una imagen', type=['jpg', 'jpeg', 'png'])
@@ -157,7 +183,7 @@ if uploaded_file is not None:
                 cropped = image[y1:y2, x1:x2]
 
                 with st.spinner('Leyendo placa ' + str(i + 1) + '...'):
-                    placa_final, candidatos, proc_display, variantes = \
+                    placa_final, cands_easy, cands_tess, proc_display, variantes = \
                         procesar_placa(cropped, conf_ocr)
 
                 st.image(cropped, channels='BGR', caption='Placa ' + str(i + 1))
@@ -169,7 +195,8 @@ if uploaded_file is not None:
 
                 with st.expander('Detalles Placa ' + str(i + 1)):
                     st.write('Confianza YOLO: ' + str(round(float(box.conf[0]) * 100, 2)) + '%')
-                    st.write('Votos: ' + str(candidatos))
+                    st.write('EasyOCR: ' + str(cands_easy))
+                    st.write('Tesseract: ' + str(cands_tess))
                     st.write('Placa final: ' + str(placa_final))
                     col_v1, col_v2 = st.columns(2)
                     with col_v1:
