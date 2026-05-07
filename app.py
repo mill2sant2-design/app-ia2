@@ -24,14 +24,22 @@ def load_easy():
 
 @st.cache_resource
 def load_paddle():
-    if PADDLE_DISPONIBLE:
+    if not PADDLE_DISPONIBLE:
+        return None
+    try:
+        # API versión 2.x
         return PaddleOCR(
             use_angle_cls=True,
             lang='en',
             use_gpu=False,
             show_log=False
         )
-    return None
+    except TypeError:
+        try:
+            # API versión 3.x (parámetros reducidos)
+            return PaddleOCR(lang='en', show_log=False)
+        except Exception:
+            return None
 
 model         = load_model()
 easy_reader   = load_easy()
