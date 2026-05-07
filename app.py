@@ -143,7 +143,7 @@ def procesar_placa(cropped, conf_ocr):
     cands_tess = run_tesseract(variantes)
 
     # Tesseract recibe 5x mas peso porque lee mejor caracteres dificiles
-    todos = cands_easy + (cands_tess * 5)
+    todos = cands_easy + (cands_tess * 10)
 
     placa_final = votar_placa(todos)
     return placa_final, cands_easy, cands_tess, proc_display, variantes
