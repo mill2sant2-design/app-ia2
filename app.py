@@ -1,10 +1,14 @@
 import re
+import io
+import datetime
 import streamlit as st
 import cv2
 import numpy as np
 import easyocr
 import pytesseract
+from fpdf import FPDF
 from ultralytics import YOLO
+from PIL import Image
 
 st.set_page_config(page_title="Deteccion de Placas", layout="wide")
 st.title("Deteccion, Recorte y Lectura de Placas Vehiculares")
@@ -141,13 +145,122 @@ def procesar_placa(cropped, conf_ocr):
     variantes, proc_display = preprocesar(cropped)
     cands_easy = run_easyocr(variantes, conf_ocr)
     cands_tess = run_tesseract(variantes)
-
-    # Tesseract recibe 5x mas peso porque lee mejor caracteres dificiles
-    todos = cands_easy + (cands_tess * 10)
-
+    todos       = cands_easy + (cands_tess * 5)
     placa_final = votar_placa(todos)
     return placa_final, cands_easy, cands_tess, proc_display, variantes
 
+# ── Generador de recibo PDF ────────────────────────────────────────────────────
+def generar_recibo(imagen_auto, placa, confianza_yolo, numero_recibo):
+    now      = datetime.datetime.now()
+    fecha    = now.strftime('%d/%m/%Y')
+    hora     = now.strftime('%H:%M:%S')
+
+    pdf = FPDF()
+    pdf.add_page()
+
+    # ── Encabezado ─────────────────────────────────────────────────────────────
+    pdf.set_fill_color(30, 30, 30)
+    pdf.rect(0, 0, 210, 40, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font('Helvetica', 'B', 20)
+    pdf.set_xy(0, 8)
+    pdf.cell(210, 10, 'SISTEMA DE DETECCION VEHICULAR', align='C')
+    pdf.set_font('Helvetica', '', 11)
+    pdf.set_xy(0, 22)
+    pdf.cell(210, 10, 'Registro Automatico de Placas', align='C')
+
+    # ── Numero de recibo ───────────────────────────────────────────────────────
+    pdf.set_fill_color(52, 152, 219)
+    pdf.rect(0, 40, 210, 14, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_xy(0, 43)
+    pdf.cell(210, 8, 'RECIBO N  ' + str(numero_recibo).zfill(6), align='C')
+
+    # ── Fecha y hora ───────────────────────────────────────────────────────────
+    pdf.set_text_color(50, 50, 50)
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_xy(15, 62)
+    pdf.cell(85, 8, 'FECHA DE DETECCION:', border=0)
+    pdf.set_font('Helvetica', 'B', 10)
+    pdf.set_xy(80, 62)
+    pdf.cell(60, 8, fecha, border=0)
+
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_xy(15, 72)
+    pdf.cell(85, 8, 'HORA DE DETECCION:', border=0)
+    pdf.set_font('Helvetica', 'B', 10)
+    pdf.set_xy(80, 72)
+    pdf.cell(60, 8, hora, border=0)
+
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_xy(15, 82)
+    pdf.cell(85, 8, 'CONFIANZA DETECCION YOLO:', border=0)
+    pdf.set_font('Helvetica', 'B', 10)
+    pdf.set_xy(80, 82)
+    pdf.cell(60, 8, str(round(confianza_yolo * 100, 2)) + '%', border=0)
+
+    # ── Placa destacada ────────────────────────────────────────────────────────
+    pdf.set_fill_color(241, 196, 15)
+    pdf.rect(15, 96, 180, 36, 'F')
+    pdf.set_draw_color(30, 30, 30)
+    pdf.set_line_width(1.5)
+    pdf.rect(15, 96, 180, 36)
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_xy(15, 99)
+    pdf.cell(180, 6, 'PLACA DETECTADA', align='C')
+    pdf.set_font('Helvetica', 'B', 36)
+    pdf.set_xy(15, 106)
+    pdf.cell(180, 22, placa if placa else 'NO DETECTADA', align='C')
+
+    # ── Foto del vehiculo ──────────────────────────────────────────────────────
+    pdf.set_text_color(50, 50, 50)
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_xy(15, 142)
+    pdf.cell(180, 8, 'FOTOGRAFIA DEL VEHICULO', align='C')
+
+    try:
+        img_rgb  = cv2.cvtColor(imagen_auto, cv2.COLOR_BGR2RGB)
+        pil_img  = Image.fromarray(img_rgb)
+        buf      = io.BytesIO()
+        pil_img.save(buf, format='JPEG', quality=90)
+        buf.seek(0)
+
+        # Calcular dimensiones manteniendo proporcion
+        h_img, w_img = imagen_auto.shape[:2]
+        max_w, max_h = 180, 100
+        ratio  = min(max_w / w_img, max_h / h_img)
+        new_w  = int(w_img * ratio)
+        new_h  = int(h_img * ratio)
+        x_img  = 15 + (max_w - new_w) / 2
+
+        with open('/tmp/auto_temp.jpg', 'wb') as f:
+            f.write(buf.read())
+        pdf.image('/tmp/auto_temp.jpg', x=x_img, y=152, w=new_w, h=new_h)
+    except Exception:
+        pdf.set_xy(15, 155)
+        pdf.set_font('Helvetica', '', 10)
+        pdf.cell(180, 10, 'Imagen no disponible', align='C')
+
+    # ── Linea separadora ───────────────────────────────────────────────────────
+    pdf.set_draw_color(200, 200, 200)
+    pdf.set_line_width(0.5)
+    pdf.line(15, 258, 195, 258)
+
+    # ── Pie de pagina ──────────────────────────────────────────────────────────
+    pdf.set_fill_color(30, 30, 30)
+    pdf.rect(0, 267, 210, 30, 'F')
+    pdf.set_text_color(180, 180, 180)
+    pdf.set_font('Helvetica', '', 8)
+    pdf.set_xy(0, 272)
+    pdf.cell(210, 5, 'Este documento es generado automaticamente por el Sistema de Deteccion Vehicular', align='C')
+    pdf.set_xy(0, 279)
+    pdf.cell(210, 5, 'Generado el ' + fecha + ' a las ' + hora, align='C')
+
+    return pdf.output()
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.header('Configuracion')
 conf_threshold = st.sidebar.slider('Confianza deteccion', 0.0, 1.0, 0.25)
 conf_ocr       = st.sidebar.slider('Confianza OCR',       0.0, 1.0, 0.15)
@@ -155,6 +268,11 @@ st.sidebar.markdown('---')
 st.sidebar.caption('Motores: EasyOCR + Tesseract (peso 5x)')
 st.sidebar.caption('Recomendado: deteccion 0.1-0.3, OCR 0.1-0.2')
 
+# Contador de recibos en session
+if 'num_recibo' not in st.session_state:
+    st.session_state.num_recibo = 1
+
+# ── Subida de imagen ───────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader('Sube una imagen', type=['jpg', 'jpeg', 'png'])
 
 if uploaded_file is not None:
@@ -189,6 +307,8 @@ if uploaded_file is not None:
                     placa_final, cands_easy, cands_tess, proc_display, variantes = \
                         procesar_placa(cropped, conf_ocr)
 
+                confianza_yolo = float(box.conf[0])
+
                 st.image(cropped, channels='BGR', caption='Placa ' + str(i + 1))
 
                 if placa_final:
@@ -196,8 +316,27 @@ if uploaded_file is not None:
                 else:
                     st.warning('No se pudo leer la placa')
 
+                # ── Boton de recibo ────────────────────────────────────────────
+                if placa_final:
+                    pdf_bytes = generar_recibo(
+                        image,
+                        placa_final,
+                        confianza_yolo,
+                        st.session_state.num_recibo
+                    )
+                    nombre_archivo = 'recibo_' + placa_final + '_' + \
+                        datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '.pdf'
+                    st.download_button(
+                        label='Descargar Recibo PDF',
+                        data=bytes(pdf_bytes),
+                        file_name=nombre_archivo,
+                        mime='application/pdf',
+                        key='recibo_' + str(i) + '_' + str(st.session_state.num_recibo)
+                    )
+                    st.session_state.num_recibo += 1
+
                 with st.expander('Detalles Placa ' + str(i + 1)):
-                    st.write('Confianza YOLO: ' + str(round(float(box.conf[0]) * 100, 2)) + '%')
+                    st.write('Confianza YOLO: ' + str(round(confianza_yolo * 100, 2)) + '%')
                     st.write('EasyOCR: ' + str(cands_easy))
                     st.write('Tesseract: ' + str(cands_tess))
                     st.write('Placa final: ' + str(placa_final))
