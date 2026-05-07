@@ -20,7 +20,13 @@ def load_easy():
 
 @st.cache_resource
 def load_paddle():
-    return PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+    try:
+        return PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+    except TypeError:
+        try:
+            return PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+        except Exception:
+            return None
 
 model  = load_model()
 easy   = load_easy()
@@ -49,11 +55,6 @@ def corregir_placa(t: str) -> str:
     return letras + nums + final
 
 def extraer_placa(texto: str) -> tuple:
-    """
-    Ventana deslizante de 6 chars.
-    Devuelve (placa, correcciones_necesarias).
-    Elige la ventana con menos correcciones.
-    """
     patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
     limpio = re.sub(r'[^A-Z0-9]', '', texto.upper())
 
@@ -89,7 +90,8 @@ def preprocesar(cropped: np.ndarray) -> tuple:
     _, otsu_s = cv2.threshold(cv2.filter2D(gray, -1, kernel), 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    return [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)], otsu
+    variantes = [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)]
+    return variantes, otsu
 
 # ── OCR con EasyOCR ────────────────────────────────────────────────────────────
 def ocr_easy(variantes: list, conf_ocr: float) -> tuple:
@@ -114,12 +116,17 @@ def ocr_easy(variantes: list, conf_ocr: float) -> tuple:
 
 # ── OCR con PaddleOCR ──────────────────────────────────────────────────────────
 def ocr_paddle(variantes: list) -> tuple:
+    if paddle is None:
+        return None, float('inf')
+
     patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
     for img in variantes:
-        # PaddleOCR espera BGR o RGB numpy array
-        if len(img.shape) == 2:          # si es escala de grises, convertir
+        if len(img.shape) == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        resultado = paddle.ocr(img, cls=True)
+        try:
+            resultado = paddle.ocr(img, cls=True)
+        except Exception:
+            continue
         if not resultado or not resultado[0]:
             continue
         texto = ''.join(
@@ -133,12 +140,6 @@ def ocr_paddle(variantes: list) -> tuple:
 
 # ── Votación entre motores ─────────────────────────────────────────────────────
 def ocr_votacion(variantes: list, conf_ocr: float) -> tuple:
-    """
-    Corre EasyOCR y PaddleOCR en paralelo.
-    - Si ambos coinciden → resultado seguro.
-    - Si difieren → gana el que necesitó menos correcciones.
-    - Si solo uno encuentra placa → usa ese.
-    """
     placa_easy,   corr_easy   = ocr_easy(variantes, conf_ocr)
     placa_paddle, corr_paddle = ocr_paddle(variantes)
 
@@ -146,9 +147,9 @@ def ocr_votacion(variantes: list, conf_ocr: float) -> tuple:
         if placa_easy == placa_paddle:
             return placa_easy, "✅ Ambos motores coinciden"
         elif corr_easy <= corr_paddle:
-            return placa_easy,   f"⚖️ EasyOCR ({corr_easy} correc.) vs Paddle ({corr_paddle} correc.) → EasyOCR"
+            return placa_easy,   f"⚖️ EasyOCR gana ({corr_easy} vs {corr_paddle} correcciones)"
         else:
-            return placa_paddle, f"⚖️ EasyOCR ({corr_easy} correc.) vs Paddle ({corr_paddle} correc.) → Paddle"
+            return placa_paddle, f"⚖️ PaddleOCR gana ({corr_paddle} vs {corr_easy} correcciones)"
     elif placa_easy:
         return placa_easy,   "🔵 Solo EasyOCR encontró placa"
     elif placa_paddle:
