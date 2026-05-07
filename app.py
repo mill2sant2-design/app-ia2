@@ -34,6 +34,7 @@ LETRA_A_NUMERO = str.maketrans({
 })
 
 def corregir_placa(t: str) -> str:
+    """Corrección posicional sobre exactamente 6 caracteres."""
     if len(t) != 6:
         return t
     letras = t[:3].translate(NUMERO_A_LETRA)
@@ -43,49 +44,72 @@ def corregir_placa(t: str) -> str:
     return letras + nums + final
 
 def extraer_placa(texto: str) -> str | None:
-    """Ventana deslizante de 6 chars sobre el texto limpio."""
+    """
+    Evalúa todas las ventanas de 6 chars y elige la que
+    necesite menos correcciones posicionales.
+    La placa real casi nunca necesita correcciones;
+    los falsos positivos por caracteres fantasma sí.
+    """
     patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
     limpio = re.sub(r'[^A-Z0-9]', '', texto.upper())
+
+    mejor_placa        = None
+    menor_correcciones = float('inf')
+
     for i in range(len(limpio) - 5):
-        corregido = corregir_placa(limpio[i:i+6])
+        candidato = limpio[i:i+6]
+        corregido = corregir_placa(candidato)
+
         if patron.match(corregido):
-            return corregido
-    return None
+            correcciones = sum(1 for a, b in zip(candidato, corregido) if a != b)
+            if correcciones < menor_correcciones:
+                menor_correcciones = correcciones
+                mejor_placa        = corregido
+
+    return mejor_placa
 
 def filtrar_por_altura(resultado: list, img_h: int, min_ratio: float = 0.30) -> list:
     """
     Descarta detecciones cuya altura sea menor a min_ratio * altura_imagen.
-    Esto elimina el texto pequeño de la ciudad sin tocar los caracteres grandes.
+    Elimina el texto pequeño de la ciudad sin tocar los caracteres grandes.
     """
     filtrados = []
     for (bbox, txt, prob) in resultado:
-        ys       = [p[1] for p in bbox]
-        char_h   = max(ys) - min(ys)
-        ratio    = char_h / img_h
-        if ratio >= min_ratio:
+        ys     = [p[1] for p in bbox]
+        char_h = max(ys) - min(ys)
+        if (char_h / img_h) >= min_ratio:
             filtrados.append((bbox, txt, prob))
     return filtrados
 
-def preprocesar(cropped: np.ndarray) -> list:
-    """Genera variantes sin recortar la imagen original."""
+def preprocesar(cropped: np.ndarray) -> tuple:
+    """Genera 5 variantes de preprocesamiento sin recortar la imagen."""
     grande = cv2.resize(cropped, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     gray   = cv2.cvtColor(grande, cv2.COLOR_BGR2GRAY)
 
     _, otsu   = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
     clahe     = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    _, otsu_c = cv2.threshold(clahe.apply(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu_c = cv2.threshold(clahe.apply(gray), 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
     kernel    = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     _, otsu_s = cv2.threshold(cv2.filter2D(gray, -1, kernel), 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    return [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)], otsu
+    variantes = [grande, otsu, otsu_c, otsu_s, cv2.bitwise_not(otsu)]
+    return variantes, otsu
 
 def ocr_multi_variante(variantes: list, conf_ocr: float) -> tuple:
+    """
+    Prueba cada variante con EasyOCR.
+    Filtra por altura para eliminar ciudad y elige
+    la variante que produzca una placa válida.
+    """
     patron = re.compile(r'^[A-Z]{3}[0-9]{2}[0-9A-Z]$')
 
     for img in variantes:
-        img_h      = img.shape[0]
-        resultado  = reader.readtext(
+        img_h     = img.shape[0]
+        resultado = reader.readtext(
             img,
             allowlist=ALLOWLIST,
             contrast_ths=0.3,
@@ -94,19 +118,19 @@ def ocr_multi_variante(variantes: list, conf_ocr: float) -> tuple:
             low_text=0.3,
             paragraph=False,
         )
-        # ── Filtrar por tamaño: descartar texto pequeño (ciudad) ───────────────
         resultado_filtrado = filtrar_por_altura(resultado, img_h, min_ratio=0.30)
 
         texto_unido = ''.join(
             txt for (_, txt, prob) in resultado_filtrado if prob >= conf_ocr
         )
         placa = extraer_placa(texto_unido)
+
         if placa and patron.match(placa):
             fragmentos = [txt.upper() for (_, txt, prob) in resultado_filtrado
                           if prob >= conf_ocr]
             return placa, fragmentos, resultado_filtrado
 
-    # Fallback sin filtro de confianza
+    # Fallback: primera variante sin filtro de confianza
     img_h     = variantes[0].shape[0]
     resultado = reader.readtext(variantes[0], allowlist=ALLOWLIST, paragraph=False)
     resultado_filtrado = filtrar_por_altura(resultado, img_h, min_ratio=0.30)
@@ -176,7 +200,7 @@ if uploaded_file is not None:
                     st.write(f"**OCR crudo:** {resultado_crudo}")
                     col_v1, col_v2 = st.columns(2)
                     with col_v1:
-                        st.image(proc_display, caption="Otsu completo")
+                        st.image(proc_display, caption="Otsu")
                     with col_v2:
                         st.image(variantes[2], caption="CLAHE + Otsu")
 
